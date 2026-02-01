@@ -9,7 +9,7 @@ from sklearn.metrics import roc_auc_score
 from scipy.stats import pearsonr
 import xgboost as xgb
 
-from utils.models import Smile2SmileEncoderWithJEPA, LlamaConfig
+from utils.models import Smile2SmileVAE, Smile2SmileEncoderWithJEPA, LlamaConfig
 from tokenizers import Tokenizer
 
 
@@ -38,26 +38,34 @@ ALL_DATASETS = {**CLASSIFICATION_DATASETS, **REGRESSION_DATASETS}
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate on MolNet benchmarks")
     parser.add_argument("--model", type=str,
-                        default='s3://shvaibackups/mol_porque/molporque_10layer_jepa0_contrastive1_decode1/40001.pt',
+                        default='s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/40001.pt',
                         help="Model: 's3://...' or local path for our encoder, or 'molformer'/'chemberta'/'chemberta-mlm'")
     parser.add_argument("--data_path", type=str,
                         default="/home/ubuntu/chemberta3/chemberta3_benchmarking/data/datasets/deepchem_splits/")
     parser.add_argument("--datasets", type=str, nargs='+', default=list(ALL_DATASETS.keys()),
                         choices=list(ALL_DATASETS.keys()), help="Datasets to evaluate")
-    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--emb_dim", type=int, default=768)
     parser.add_argument("--intermediate_size_multiplier", type=float, default=4)
-    parser.add_argument("--num_layers", type=int, default=10)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--max_mol_size", type=int, default=200)
+    parser.add_argument("--num_layers", type=int, default=20)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--max_mol_size", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--n_bootstrap", type=int, default=1000, help="Number of bootstrap samples")
     parser.add_argument("--ci_type", type=str, default='normal_approx', choices=['normal_approx', 'bootstrap'],
                         help="CI method: 'normal_approx' or 'bootstrap'")
+    parser.add_argument("--noise_scale", type=float, default=0.0, help="Noise scale for VAE encoding (0 = deterministic)")
+    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out_file", type=str, default=None, help="Output CSV file for results (optional)")
     return parser.parse_args()
 
 
-def load_encoder(args, tokenizer, device):
+def is_vae_model(model_path):
+    """Check if model path indicates VAE or JEPA model."""
+    return 'mol_vae_v9000' in model_path
+
+
+def load_model(args, tokenizer, device):
     vocab_size = max(tokenizer.get_vocab().values()) + 1
     config_kwargs = dict(
         vocab_size=vocab_size, hidden_size=args.emb_dim,
@@ -70,8 +78,15 @@ def load_encoder(args, tokenizer, device):
     )
     encoder_config = LlamaConfig(**config_kwargs)
     decoder_config = LlamaConfig(**config_kwargs)
-    model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
-    
+
+    use_vae = is_vae_model(args.model)
+    if use_vae:
+        model = Smile2SmileVAE(encoder_config, decoder_config)
+        print("Using VAE model")
+    else:
+        model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
+        print("Using JEPA encoder model")
+
     print(f"Loading checkpoint from: {args.model}")
     if args.model.startswith('s3://'):
         from s3torchconnector import S3Checkpoint
@@ -79,15 +94,15 @@ def load_encoder(args, tokenizer, device):
             checkpoint = torch.load(reader, map_location='cpu')
     else:
         checkpoint = torch.load(args.model, map_location='cpu')
-    
+
     if any(k.startswith('_orig_mod.') for k in checkpoint.keys()):
         checkpoint = {k.replace('_orig_mod.', '', 1): v for k, v in checkpoint.items()}
     model.load_state_dict(checkpoint)
     del checkpoint
-    return model.encoder.to(device).eval()
+    return model.to(device).eval(), use_vae
 
 
-def get_embeddings(smiles_list, encoder, tokenizer, args, device):
+def get_embeddings(smiles_list, model, tokenizer, args, device, use_vae):
     pad_token_id = tokenizer.token_to_id("[PAD]")
     embeddings = []
     for i in tqdm(range(0, len(smiles_list), args.batch_size), desc="Embeddings", leave=False):
@@ -101,8 +116,13 @@ def get_embeddings(smiles_list, encoder, tokenizer, args, device):
         input_ids = torch.tensor(all_ids, dtype=torch.long, device=device)
         attention_mask = torch.tensor(all_masks, dtype=torch.bool, device=device)
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            output = encoder(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
+            if use_vae:
+                encode_out = model.encode(input_ids=input_ids, attention_mask=attention_mask, noise_ratio=args.noise_scale)
+                # latent is [bs, 1, hidden_size], squeeze the middle dim
+                embeddings.append(encode_out['latent'].squeeze(1).float().cpu().numpy())
+            else:
+                output = model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
     return np.concatenate(embeddings, axis=0)
 
 
@@ -286,7 +306,7 @@ def evaluate_regression_task(train_emb, train_labels, val_emb, val_labels, test_
 
 # ============== Dataset evaluation ==============
 
-def get_embeddings_for_dataset(train_df, val_df, test_df, args, encoder, tokenizer, device):
+def get_embeddings_for_dataset(train_df, val_df, test_df, args, model, tokenizer, device, use_vae):
     """Get embeddings for train/val/test splits."""
     if args.model in ['molformer', 'chemberta', 'chemberta-mlm']:
         from utils.deepchem_embeddings import get_deepchem_embeddings
@@ -294,13 +314,13 @@ def get_embeddings_for_dataset(train_df, val_df, test_df, args, encoder, tokeniz
         val_emb = get_deepchem_embeddings(val_df['smiles'].tolist(), args.model, args.batch_size, device)
         test_emb = get_deepchem_embeddings(test_df['smiles'].tolist(), args.model, args.batch_size, device)
     else:
-        train_emb = get_embeddings(train_df['smiles'].tolist(), encoder, tokenizer, args, device)
-        val_emb = get_embeddings(val_df['smiles'].tolist(), encoder, tokenizer, args, device)
-        test_emb = get_embeddings(test_df['smiles'].tolist(), encoder, tokenizer, args, device)
+        train_emb = get_embeddings(train_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
+        val_emb = get_embeddings(val_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
+        test_emb = get_embeddings(test_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
     return train_emb, val_emb, test_emb
 
 
-def evaluate_classification_dataset(dataset_name, args, encoder, tokenizer, device):
+def evaluate_classification_dataset(dataset_name, args, model, tokenizer, device, use_vae):
     """Evaluate a classification dataset."""
     print(f"\n{'='*70}")
     print(f"CLASSIFICATION: {dataset_name.upper()}")
@@ -320,7 +340,7 @@ def evaluate_classification_dataset(dataset_name, args, encoder, tokenizer, devi
     print(f"Tasks ({len(task_cols)}): {task_cols[:5]}{'...' if len(task_cols) > 5 else ''}")
 
     train_emb, val_emb, test_emb = get_embeddings_for_dataset(
-        train_df, val_df, test_df, args, encoder, tokenizer, device)
+        train_df, val_df, test_df, args, model, tokenizer, device, use_vae)
 
     results = {'tasks': {}, 'linear_scores': [], 'xgb_scores': [], 'task_type': 'classification'}
 
@@ -343,7 +363,7 @@ def evaluate_classification_dataset(dataset_name, args, encoder, tokenizer, devi
     return results
 
 
-def evaluate_regression_dataset(dataset_name, args, encoder, tokenizer, device):
+def evaluate_regression_dataset(dataset_name, args, model, tokenizer, device, use_vae):
     """Evaluate a regression dataset."""
     print(f"\n{'='*70}")
     print(f"REGRESSION: {dataset_name.upper()}")
@@ -360,7 +380,7 @@ def evaluate_regression_dataset(dataset_name, args, encoder, tokenizer, device):
     print(f"Tasks: {task_cols}")
 
     train_emb, val_emb, test_emb = get_embeddings_for_dataset(
-        train_df, val_df, test_df, args, encoder, tokenizer, device)
+        train_df, val_df, test_df, args, model, tokenizer, device, use_vae)
 
     results = {'tasks': {}, 'linear_scores': [], 'xgb_scores': [], 'task_type': 'regression'}
 
@@ -456,18 +476,18 @@ def print_results(results, dataset_name, ci_type, n_bootstrap, seed):
 def main():
     args = parse_args()
     np.random.seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{args.device}')
     print(f"Using device: {device}")
     print(f"Model: {args.model}")
     print(f"Datasets: {args.datasets}")
     print(f"CI type: {args.ci_type}")
 
-    # Load encoder if using our model
-    encoder, tokenizer = None, None
+    # Load model if using our model
+    model, tokenizer, use_vae = None, None, False
     if args.model not in ['molformer', 'chemberta', 'chemberta-mlm']:
         tokenizer = Tokenizer.from_file('tokenizers/smiles_tokenizer_simple/tokenizer.json')
-        encoder = load_encoder(args, tokenizer, device)
-        print("Encoder loaded successfully")
+        model, use_vae = load_model(args, tokenizer, device)
+        print("Model loaded successfully")
 
     # Separate classification and regression datasets
     clf_datasets = [d for d in args.datasets if d in CLASSIFICATION_DATASETS]
@@ -477,13 +497,13 @@ def main():
 
     # Classification
     for dataset_name in clf_datasets:
-        results = evaluate_classification_dataset(dataset_name, args, encoder, tokenizer, device)
+        results = evaluate_classification_dataset(dataset_name, args, model, tokenizer, device, use_vae)
         clf_results[dataset_name] = results
         print_results(results, dataset_name, args.ci_type, args.n_bootstrap, args.seed)
 
     # Regression
     for dataset_name in reg_datasets:
-        results = evaluate_regression_dataset(dataset_name, args, encoder, tokenizer, device)
+        results = evaluate_regression_dataset(dataset_name, args, model, tokenizer, device, use_vae)
         reg_results[dataset_name] = results
         print_results(results, dataset_name, args.ci_type, args.n_bootstrap, args.seed)
 
@@ -531,6 +551,98 @@ def main():
 
     print_summary(clf_results, "CLASSIFICATION", "AUC")
     print_summary(reg_results, "REGRESSION", "Corr")
+
+    # Save results to CSV if --out_file is specified
+    if args.out_file is not None:
+        rows = []
+        all_clf_stats = []
+        for dataset_name, results in clf_results.items():
+            # One row per task
+            for task_name, task_stats in results['tasks'].items():
+                lr_stats = task_stats['linear']
+                rows.append({
+                    'dataset': dataset_name,
+                    'model': args.model,
+                    'metric_type': f"{dataset_name}_{task_name}",
+                    'metric_value': lr_stats['mean'],
+                    'metric_90pct_ci': f"[{lr_stats['p05']:.4f}-{lr_stats['p95']:.4f}]",
+                    'metric_95pct_ci': f"[{lr_stats['p025']:.4f}-{lr_stats['p975']:.4f}]",
+                })
+            # Dataset average row
+            if len(results['tasks']) > 1:
+                avg_stats = mean_score_ci(results['tasks'], 'linear', args.ci_type, args.n_bootstrap, args.seed)
+            else:
+                task = list(results['tasks'].keys())[0]
+                avg_stats = results['tasks'][task]['linear']
+            all_clf_stats.append(avg_stats)
+            rows.append({
+                'dataset': dataset_name,
+                'model': args.model,
+                'metric_type': f"{dataset_name}_avg",
+                'metric_value': avg_stats['mean'],
+                'metric_90pct_ci': f"[{avg_stats['p05']:.4f}-{avg_stats['p95']:.4f}]",
+                'metric_95pct_ci': f"[{avg_stats['p025']:.4f}-{avg_stats['p975']:.4f}]",
+            })
+        # Overall classification average
+        if all_clf_stats:
+            overall_mean = np.mean([s['mean'] for s in all_clf_stats])
+            overall_se = np.sqrt(np.sum([s['std']**2 for s in all_clf_stats])) / len(all_clf_stats)
+            rows.append({
+                'dataset': 'all_classification',
+                'model': args.model,
+                'metric_type': 'classification_avg',
+                'metric_value': overall_mean,
+                'metric_90pct_ci': f"[{overall_mean - 1.645*overall_se:.4f}-{overall_mean + 1.645*overall_se:.4f}]",
+                'metric_95pct_ci': f"[{overall_mean - 1.96*overall_se:.4f}-{overall_mean + 1.96*overall_se:.4f}]",
+            })
+
+        all_reg_stats = []
+        for dataset_name, results in reg_results.items():
+            # One row per task
+            for task_name, task_stats in results['tasks'].items():
+                lr_stats = task_stats['linear']
+                rows.append({
+                    'dataset': dataset_name,
+                    'model': args.model,
+                    'metric_type': f"{dataset_name}_{task_name}",
+                    'metric_value': lr_stats['mean'],
+                    'metric_90pct_ci': f"[{lr_stats['p05']:.4f}-{lr_stats['p95']:.4f}]",
+                    'metric_95pct_ci': f"[{lr_stats['p025']:.4f}-{lr_stats['p975']:.4f}]",
+                })
+            # Dataset average row
+            if len(results['tasks']) > 1:
+                avg_stats = mean_score_ci(results['tasks'], 'linear', args.ci_type, args.n_bootstrap, args.seed)
+            else:
+                task = list(results['tasks'].keys())[0]
+                avg_stats = results['tasks'][task]['linear']
+            all_reg_stats.append(avg_stats)
+            rows.append({
+                'dataset': dataset_name,
+                'model': args.model,
+                'metric_type': f"{dataset_name}_avg",
+                'metric_value': avg_stats['mean'],
+                'metric_90pct_ci': f"[{avg_stats['p05']:.4f}-{avg_stats['p95']:.4f}]",
+                'metric_95pct_ci': f"[{avg_stats['p025']:.4f}-{avg_stats['p975']:.4f}]",
+            })
+        # Overall regression average
+        if all_reg_stats:
+            overall_mean = np.mean([s['mean'] for s in all_reg_stats])
+            overall_se = np.sqrt(np.sum([s['std']**2 for s in all_reg_stats])) / len(all_reg_stats)
+            rows.append({
+                'dataset': 'all_regression',
+                'model': args.model,
+                'metric_type': 'regression_avg',
+                'metric_value': overall_mean,
+                'metric_90pct_ci': f"[{overall_mean - 1.645*overall_se:.4f}-{overall_mean + 1.645*overall_se:.4f}]",
+                'metric_95pct_ci': f"[{overall_mean - 1.96*overall_se:.4f}-{overall_mean + 1.96*overall_se:.4f}]",
+            })
+
+        out_df = pd.DataFrame(rows)
+        out_dir = os.path.dirname(args.out_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        out_df.to_csv(args.out_file, index=False)
+        print(f"\nResults saved to {args.out_file}")
 
 
 if __name__ == "__main__":

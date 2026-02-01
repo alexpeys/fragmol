@@ -66,7 +66,7 @@ def parse_args():
     
     # Checkpoint
     parser.add_argument("--checkpoint", type=str, 
-                        default="s3://shvaibackups/robosean/500m_robosean/60001.pt")
+                        default="s3://shvaibackups/robosean/500m_robosean_molprefix/30001.pt")
     
     # Model architecture (same as train_robosean)
     parser.add_argument("--emb_dim", type=int, default=1024)
@@ -82,9 +82,11 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--cuda", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--force_reactants", type=str, default="synthesis/10k_reactants.parquet",
+    parser.add_argument("--force_reactants", type=str, default="synthesis/enamine_us_building_blocks.parquet",
                         help="Path to reactant library parquet. Set to '' to disable.")
-    
+    parser.add_argument("--input_type", type=str, default="properties", choices=["properties", "molecule"],
+                        help="Conditioning type: 'properties' or 'molecule'")
+
     return parser.parse_args()
 
 
@@ -459,6 +461,149 @@ def generate_with_shots(model, tokenizer, reactions, prop_tokens_list, args, dev
     return results
 
 
+def generate_mol_conditional_with_shots(model, tokenizer, reactions, target_smiles_list, args, device, reactant_lib=None):
+    """Generate molecules conditioned on target SMILES, return best by Tanimoto similarity."""
+    eos_id = tokenizer.convert_tokens_to_ids('[EOS]')
+    use_inline_swapping = reactant_lib is not None
+
+    num_inputs = len(target_smiles_list)
+    print(f"Mol-conditional generation: {num_inputs} targets x {args.shots} shots each...")
+    if use_inline_swapping:
+        print("Using inline reactant swapping (stop, swap, continue)")
+
+    results = []  # (target_smiles, best_generated_smiles, best_tanimoto, best_path)
+
+    for idx, target_smiles in enumerate(tqdm(target_smiles_list, desc="Targets")):
+        # Validate target
+        target_mol = Chem.MolFromSmiles(target_smiles)
+        if target_mol is None:
+            results.append((target_smiles, None, 0.0, None))
+            continue
+
+        target_fp = AllChem.GetMorganFingerprintAsBitVect(target_mol, radius=3, nBits=1024)
+
+        # Create input: [CLS]{smiles}[CLS][BOS]
+        prefix_str = f'[CLS]{target_smiles}[CLS][BOS]'
+        encoded = tokenizer.encode(prefix_str)
+        tokens = encoded if isinstance(encoded, list) else list(encoded)
+
+        best_smiles = None
+        best_path = None
+        best_tanimoto = -1.0
+
+        if use_inline_swapping:
+            # Sequential generation with inline swapping (can't batch)
+            for shot in range(args.shots):
+                try:
+                    seq, swaps = generate_with_reactant_swapping(
+                        model=model,
+                        tokenizer=tokenizer,
+                        input_ids=tokens,
+                        reactant_lib=reactant_lib,
+                        max_len=args.max_len,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        device=device,
+                    )
+                    seq_list = seq if isinstance(seq, list) else seq.tolist()
+                    decoded = tokenizer.decode(seq_list).replace(' ', '')
+
+                    # Remove [CLS]...[CLS] prefix
+                    first_cls = decoded.find('[CLS]')
+                    if first_cls >= 0:
+                        second_cls = decoded.find('[CLS]', first_cls + 5)
+                        if second_cls >= 0:
+                            decoded = decoded[:first_cls] + decoded[second_cls + 5:]
+
+                    for tok in ['[BOS]', '[EOS]', '[PAD]'] + property_tokens:
+                        decoded = decoded.replace(tok, '')
+                    decoded = decoded.strip()
+
+                    if not decoded.startswith('<ADD>'):
+                        continue
+
+                    result, _ = execute_path(decoded, reactions)
+                    if result is None:
+                        continue
+
+                    mol = Chem.MolFromSmiles(result)
+                    if mol is None:
+                        continue
+
+                    canonical = Chem.MolToSmiles(mol, canonical=True)
+                    result_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=3, nBits=1024)
+                    tanimoto = DataStructs.TanimotoSimilarity(target_fp, result_fp)
+
+                    if tanimoto > best_tanimoto:
+                        best_tanimoto = tanimoto
+                        best_smiles = canonical
+                        best_path = decoded
+
+                except Exception:
+                    continue
+        else:
+            # Batched generation (all shots at once)
+            batch_inputs = [torch.tensor(tokens, device=device) for _ in range(args.shots)]
+            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+                batch_generated = model.generate(
+                    input_ids_list=batch_inputs,
+                    conditioning_embeddings=None,
+                    max_generated_tokens=args.max_len,
+                    stop_token_id=eos_id,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+
+            for seq in batch_generated:
+                try:
+                    seq_list = seq if isinstance(seq, list) else seq.tolist()
+                    decoded = tokenizer.decode(seq_list).replace(' ', '')
+
+                    # Remove [CLS]...[CLS] prefix
+                    first_cls = decoded.find('[CLS]')
+                    if first_cls >= 0:
+                        second_cls = decoded.find('[CLS]', first_cls + 5)
+                        if second_cls >= 0:
+                            decoded = decoded[:first_cls] + decoded[second_cls + 5:]
+
+                    for tok in ['[BOS]', '[EOS]', '[PAD]'] + property_tokens:
+                        decoded = decoded.replace(tok, '')
+                    decoded = decoded.strip()
+
+                    if not decoded.startswith('<ADD>'):
+                        continue
+
+                    result, _ = execute_path(decoded, reactions)
+                    if result is None:
+                        continue
+
+                    mol = Chem.MolFromSmiles(result)
+                    if mol is None:
+                        continue
+
+                    canonical = Chem.MolToSmiles(mol, canonical=True)
+                    result_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=3, nBits=1024)
+                    tanimoto = DataStructs.TanimotoSimilarity(target_fp, result_fp)
+
+                    if tanimoto > best_tanimoto:
+                        best_tanimoto = tanimoto
+                        best_smiles = canonical
+                        best_path = decoded
+
+                except Exception:
+                    continue
+
+        results.append((target_smiles, best_smiles, best_tanimoto, best_path))
+
+        if best_smiles is not None:
+            print(f"\n[Target {idx}] Input: {target_smiles[:50]}...")
+            print(f"[Target {idx}] Best generated: {best_smiles[:50]}...")
+            print(f"[Target {idx}] Tanimoto: {best_tanimoto:.4f}")
+            print(f"[Target {idx}] Path: {best_path[:80]}...")
+
+    return results
+
+
 def main():
     args = parse_args()
     
@@ -479,92 +624,120 @@ def main():
     # Load reactions
     reactions = get_reactions()
 
-    # Load reactant library if specified
-    reactant_lib = None
-    if args.force_reactants:
-        reactant_lib = ReactantLibrary(args.force_reactants)
-
-    # Load ZINC molecules and get property distributions
+    # Load ZINC molecules
     print("Loading ZINC molecules...")
     zinc_path = "s3://shvaibackups/unibio_data/zinc22/shuffled/0000.parquet"
     df = pd.read_parquet(zinc_path, columns=['smiles'])
     zinc_smiles = df['smiles'].sample(n=args.num_mols, random_state=args.seed).tolist()
 
-    # Calculate properties for each molecule
-    print("Calculating target properties...")
-    target_properties = []
-    for smi in tqdm(zinc_smiles, desc="Getting properties"):
-        try:
-            props = calculate_properties(smi)
-            target_properties.append(props['quantized_properties'])
-        except Exception:
-            target_properties.append([])
+    # Load reactant library if specified
+    reactant_lib = None
+    if args.force_reactants:
+        reactant_lib = ReactantLibrary(args.force_reactants)
 
-    # Generate molecules
-    results = generate_with_shots(model, tokenizer, reactions, target_properties, args, device, reactant_lib)
+    if args.input_type == "molecule":
+        # Mol-conditional evaluation
+        print(f"\n=== MOL-CONDITIONAL EVALUATION ===")
+        results = generate_mol_conditional_with_shots(
+            model, tokenizer, reactions, zinc_smiles, args, device, reactant_lib
+        )
 
-    # Calculate accuracies
-    category_stats = {cat: {'correct': 0, 'total': 0} for cat in PROPERTY_CATEGORIES}
-    overall_correct = 0
-    overall_total = 0
-    valid_count = 0
+        # Calculate stats
+        valid_count = sum(1 for r in results if r[1] is not None)
+        tanimoto_scores = [r[2] for r in results if r[1] is not None]
 
-    print("\nCalculating accuracies...")
-    for idx, (target_props, result) in enumerate(tqdm(zip(target_properties, results),
-                                                       total=len(results), desc="Checking")):
-        if result is None:
-            # No valid generation - count all target props as misses
-            for cat, cat_props in PROPERTY_CATEGORIES.items():
-                for prop in target_props:
+        validity_rate = valid_count / args.num_mols * 100
+        avg_tanimoto = np.mean(tanimoto_scores) if tanimoto_scores else 0.0
+        p50_tanimoto = np.percentile(tanimoto_scores, 50) if tanimoto_scores else 0.0
+        p90_tanimoto = np.percentile(tanimoto_scores, 90) if tanimoto_scores else 0.0
+
+        print("\n" + "=" * 60)
+        print(f"MOL-CONDITIONAL RESULTS (shots={args.shots})")
+        print("=" * 60)
+        print(f"\nVALIDITY RATE: {valid_count}/{args.num_mols} ({validity_rate:.1f}%)")
+        print(f"\nTANIMOTO SIMILARITY (best of {args.shots} shots):")
+        print(f"  Mean: {avg_tanimoto:.4f}")
+        print(f"  P50:  {p50_tanimoto:.4f}")
+        print(f"  P90:  {p90_tanimoto:.4f}")
+        print("=" * 60)
+
+    else:
+        # Property-conditional evaluation (original behavior)
+        # Calculate properties for each molecule
+        print("Calculating target properties...")
+        target_properties = []
+        for smi in tqdm(zinc_smiles, desc="Getting properties"):
+            try:
+                props = calculate_properties(smi)
+                target_properties.append(props['quantized_properties'])
+            except Exception:
+                target_properties.append([])
+
+        # Generate molecules
+        results = generate_with_shots(model, tokenizer, reactions, target_properties, args, device, reactant_lib)
+
+        # Calculate accuracies
+        category_stats = {cat: {'correct': 0, 'total': 0} for cat in PROPERTY_CATEGORIES}
+        overall_correct = 0
+        overall_total = 0
+        valid_count = 0
+
+        print("\nCalculating accuracies...")
+        for idx, (target_props, result) in enumerate(tqdm(zip(target_properties, results),
+                                                           total=len(results), desc="Checking")):
+            if result is None:
+                # No valid generation - count all target props as misses
+                for cat, cat_props in PROPERTY_CATEGORIES.items():
+                    for prop in target_props:
+                        if prop in cat_props:
+                            category_stats[cat]['total'] += 1
+                            overall_total += 1
+                continue
+
+            valid_count += 1
+            smiles = result[0]
+
+            try:
+                actual_props = calculate_properties(smiles)['quantized_properties']
+            except Exception:
+                actual_props = []
+
+            # Check each target property
+            for prop in target_props:
+                # Find which category this prop belongs to
+                for cat, cat_props in PROPERTY_CATEGORIES.items():
                     if prop in cat_props:
                         category_stats[cat]['total'] += 1
                         overall_total += 1
-            continue
+                        if prop in actual_props:
+                            category_stats[cat]['correct'] += 1
+                            overall_correct += 1
+                        break
 
-        valid_count += 1
-        smiles = result[0]
+        # Print results
+        validity_rate = valid_count / args.num_mols * 100
 
-        try:
-            actual_props = calculate_properties(smiles)['quantized_properties']
-        except Exception:
-            actual_props = []
+        print("\n" + "=" * 60)
+        print(f"PROPERTY-CONDITIONAL RESULTS (shots={args.shots})")
+        print("=" * 60)
+        print(f"\nVALIDITY RATE: {valid_count}/{args.num_mols} ({validity_rate:.1f}%)\n")
 
-        # Check each target property
-        for prop in target_props:
-            # Find which category this prop belongs to
-            for cat, cat_props in PROPERTY_CATEGORIES.items():
-                if prop in cat_props:
-                    category_stats[cat]['total'] += 1
-                    overall_total += 1
-                    if prop in actual_props:
-                        category_stats[cat]['correct'] += 1
-                        overall_correct += 1
-                    break
+        for cat in ['LOG1P', 'FLEX', 'FLAT', 'SYNTH', 'MEMBRANE', 'DRUGLIKE']:
+            stats = category_stats[cat]
+            if stats['total'] > 0:
+                acc = stats['correct'] / stats['total'] * 100
+                print(f"{cat} ACC (@{args.shots}): {stats['correct']}/{stats['total']} ({acc:.1f}%)")
+            else:
+                print(f"{cat} ACC (@{args.shots}): N/A (no samples)")
 
-    # Print results
-    validity_rate = valid_count / args.num_mols * 100
-
-    print("\n" + "=" * 60)
-    print(f"RESULTS (shots={args.shots})")
-    print("=" * 60)
-    print(f"\nVALIDITY RATE: {valid_count}/{args.num_mols} ({validity_rate:.1f}%)\n")
-
-    for cat in ['LOG1P', 'FLEX', 'FLAT', 'SYNTH', 'MEMBRANE', 'DRUGLIKE']:
-        stats = category_stats[cat]
-        if stats['total'] > 0:
-            acc = stats['correct'] / stats['total'] * 100
-            print(f"{cat} ACC (@{args.shots}): {stats['correct']}/{stats['total']} ({acc:.1f}%)")
+        print()
+        if overall_total > 0:
+            overall_acc = overall_correct / overall_total * 100
+            print(f"OVERALL ACC (@{args.shots}): {overall_correct}/{overall_total} ({overall_acc:.1f}%)")
         else:
-            print(f"{cat} ACC (@{args.shots}): N/A (no samples)")
+            print(f"OVERALL ACC (@{args.shots}): N/A")
 
-    print()
-    if overall_total > 0:
-        overall_acc = overall_correct / overall_total * 100
-        print(f"OVERALL ACC (@{args.shots}): {overall_correct}/{overall_total} ({overall_acc:.1f}%)")
-    else:
-        print(f"OVERALL ACC (@{args.shots}): N/A")
-
-    print("=" * 60)
+        print("=" * 60)
 
 
 if __name__ == "__main__":

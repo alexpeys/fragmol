@@ -7,7 +7,7 @@ from tqdm import tqdm
 from sklearn.linear_model import RidgeCV
 from scipy.stats import pearsonr
 
-from utils.models import Smile2SmileEncoderWithJEPA, LlamaConfig
+from utils.models import Smile2SmileVAE, Smile2SmileEncoderWithJEPA, LlamaConfig
 from tokenizers import Tokenizer
 
 
@@ -19,22 +19,30 @@ QM9_TARGETS = ['A', 'B', 'C', 'mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve'
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate on QM9 benchmark")
     parser.add_argument("--model", type=str,
-                        default='s3://shvaibackups/mol_porque/molporque_10layer_jepa0_contrastive1_decode1/40001.pt',
+                        default='s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/40001.pt',
                         help="Model: 's3://...' or local path, or 'molformer'/'chemberta'/'chemberta-mlm'")
     parser.add_argument("--data_path", type=str, default="data/qm9/")
     parser.add_argument("--targets", type=str, nargs='+', default=QM9_TARGETS,
                         choices=QM9_TARGETS, help="Target properties to evaluate")
-    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--emb_dim", type=int, default=768)
     parser.add_argument("--intermediate_size_multiplier", type=float, default=4)
-    parser.add_argument("--num_layers", type=int, default=10)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--max_mol_size", type=int, default=200)
+    parser.add_argument("--num_layers", type=int, default=20)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--max_mol_size", type=int, default=120)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--noise_scale", type=float, default=0.0, help="Noise scale for VAE encoding (0 = deterministic)")
+    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out_file", type=str, default=None, help="Output CSV file for results (optional)")
     return parser.parse_args()
 
 
-def load_encoder(args, tokenizer, device):
+def is_vae_model(model_path):
+    """Check if model path indicates VAE or JEPA model."""
+    return 'mol_vae_v9000' in model_path
+
+
+def load_model(args, tokenizer, device):
     vocab_size = max(tokenizer.get_vocab().values()) + 1
     config_kwargs = dict(
         vocab_size=vocab_size, hidden_size=args.emb_dim,
@@ -47,7 +55,14 @@ def load_encoder(args, tokenizer, device):
     )
     encoder_config = LlamaConfig(**config_kwargs)
     decoder_config = LlamaConfig(**config_kwargs)
-    model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
+
+    use_vae = is_vae_model(args.model)
+    if use_vae:
+        model = Smile2SmileVAE(encoder_config, decoder_config)
+        print("Using VAE model")
+    else:
+        model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
+        print("Using JEPA encoder model")
 
     print(f"Loading checkpoint from: {args.model}")
     if args.model.startswith('s3://'):
@@ -61,10 +76,10 @@ def load_encoder(args, tokenizer, device):
         checkpoint = {k.replace('_orig_mod.', '', 1): v for k, v in checkpoint.items()}
     model.load_state_dict(checkpoint)
     del checkpoint
-    return model.encoder.to(device).eval()
+    return model.to(device).eval(), use_vae
 
 
-def get_embeddings(smiles_list, encoder, tokenizer, args, device):
+def get_embeddings(smiles_list, model, tokenizer, args, device, use_vae):
     pad_token_id = tokenizer.token_to_id("[PAD]")
     embeddings = []
     for i in tqdm(range(0, len(smiles_list), args.batch_size), desc="Embeddings", leave=False):
@@ -78,8 +93,13 @@ def get_embeddings(smiles_list, encoder, tokenizer, args, device):
         input_ids = torch.tensor(all_ids, dtype=torch.long, device=device)
         attention_mask = torch.tensor(all_masks, dtype=torch.bool, device=device)
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            output = encoder(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
+            if use_vae:
+                encode_out = model.encode(input_ids=input_ids, attention_mask=attention_mask, noise_ratio=args.noise_scale)
+                # latent is [bs, 1, hidden_size], squeeze the middle dim
+                embeddings.append(encode_out['latent'].squeeze(1).float().cpu().numpy())
+            else:
+                output = model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
     return np.concatenate(embeddings, axis=0)
 
 
@@ -137,7 +157,7 @@ def mean_corr_ci(task_stats):
 def main():
     args = parse_args()
     np.random.seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{args.device}')
     print(f"Using device: {device}")
     print(f"Model: {args.model}")
     print(f"Targets: {len(args.targets)} properties")
@@ -149,12 +169,12 @@ def main():
     test_df = pd.read_csv(os.path.join(args.data_path, 'test.csv'))
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    # Load encoder or use baseline
-    encoder, tokenizer = None, None
+    # Load model or use baseline
+    model, tokenizer, use_vae = None, None, False
     if args.model not in ['molformer', 'chemberta', 'chemberta-mlm']:
         tokenizer = Tokenizer.from_file('tokenizers/smiles_tokenizer_simple/tokenizer.json')
-        encoder = load_encoder(args, tokenizer, device)
-        print("Encoder loaded successfully")
+        model, use_vae = load_model(args, tokenizer, device)
+        print("Model loaded successfully")
 
     # Get embeddings
     print("\nComputing embeddings...")
@@ -164,9 +184,9 @@ def main():
         val_emb = get_deepchem_embeddings(val_df['smiles'].tolist(), args.model, args.batch_size, device)
         test_emb = get_deepchem_embeddings(test_df['smiles'].tolist(), args.model, args.batch_size, device)
     else:
-        train_emb = get_embeddings(train_df['smiles'].tolist(), encoder, tokenizer, args, device)
-        val_emb = get_embeddings(val_df['smiles'].tolist(), encoder, tokenizer, args, device)
-        test_emb = get_embeddings(test_df['smiles'].tolist(), encoder, tokenizer, args, device)
+        train_emb = get_embeddings(train_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
+        val_emb = get_embeddings(val_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
+        test_emb = get_embeddings(test_df['smiles'].tolist(), model, tokenizer, args, device, use_vae)
 
     # Evaluate each target
     print(f"\n{'='*70}")
@@ -190,6 +210,34 @@ def main():
     print("-" * 75)
     mean_stats = mean_corr_ci(all_stats)
     print(f"{'MEAN':<15} {format_ci(mean_stats, '95'):<30} {format_ci(mean_stats, '90'):<30}")
+
+    # Save results to CSV if --out_file is specified
+    if args.out_file is not None:
+        rows = []
+        for target, stats in zip(args.targets, all_stats):
+            rows.append({
+                'dataset': 'qm9',
+                'model': args.model,
+                'metric_type': f"qm9_{target}",
+                'metric_value': stats['mean'],
+                'metric_90pct_ci': f"[{stats['p05']:.4f}-{stats['p95']:.4f}]",
+                'metric_95pct_ci': f"[{stats['p025']:.4f}-{stats['p975']:.4f}]",
+            })
+        # Average row
+        rows.append({
+            'dataset': 'qm9',
+            'model': args.model,
+            'metric_type': 'qm9_avg',
+            'metric_value': mean_stats['mean'],
+            'metric_90pct_ci': f"[{mean_stats['p05']:.4f}-{mean_stats['p95']:.4f}]",
+            'metric_95pct_ci': f"[{mean_stats['p025']:.4f}-{mean_stats['p975']:.4f}]",
+        })
+        out_df = pd.DataFrame(rows)
+        out_dir = os.path.dirname(args.out_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        out_df.to_csv(args.out_file, index=False)
+        print(f"\nResults saved to {args.out_file}")
 
 
 if __name__ == "__main__":

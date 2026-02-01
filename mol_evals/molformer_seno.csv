@@ -1,0 +1,5 @@
+dataset,model,metric_type,metric_value,metric_90pct_ci,metric_95pct_ci
+seno_screen,molformer,seno_kills_young,0.7647705234061898,[0.7535-0.7760],[0.7513-0.7782]
+seno_screen,molformer,seno_kills_sen,0.7654130556392172,[0.7492-0.7816],[0.7461-0.7847]
+seno_screen,molformer,seno_senolytic,0.730766806891194,[0.6934-0.7682],[0.6862-0.7753]
+seno_screen,molformer,seno_avg,0.7536501286455337,[0.7396-0.7677],[0.7369-0.7704]

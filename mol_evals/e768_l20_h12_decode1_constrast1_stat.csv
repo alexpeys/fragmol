@@ -1,0 +1,3 @@
+dataset,model,metric_type,metric_value,metric_90pct_ci,metric_95pct_ci
+stat3_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,stat3_is_hit,0.6891932642404813,[0.6310-0.7474],[0.6199-0.7585]
+stat3_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,stat3_avg,0.6891932642404813,[0.6310-0.7474],[0.6199-0.7585]

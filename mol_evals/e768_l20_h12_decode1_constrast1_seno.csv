@@ -1,0 +1,5 @@
+dataset,model,metric_type,metric_value,metric_90pct_ci,metric_95pct_ci
+seno_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,seno_kills_young,0.7357171444141934,[0.7241-0.7473],[0.7219-0.7495]
+seno_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,seno_kills_sen,0.7243223492393913,[0.7075-0.7412],[0.7043-0.7444]
+seno_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,seno_senolytic,0.7341084386035807,[0.6968-0.7714],[0.6897-0.7785]
+seno_screen,s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/120001.pt,seno_avg,0.7313826440857217,[0.7172-0.7456],[0.7145-0.7483]

@@ -24,6 +24,7 @@ def generate_and_log_molecules(
     model,
     tokenizer,
     reactions,
+    eval_smiles_pool,
     num_molecules=100,
     temperature=1.0,
     top_p=0.95,
@@ -38,6 +39,7 @@ def generate_and_log_molecules(
         model: The EmbeddingConditionalLlamaDecoder model
         tokenizer: The synthesis tokenizer
         reactions: Reactions dict from get_reactions()
+        eval_smiles_pool: Pool of SMILES to sample from for property conditioning
         num_molecules: Number of molecules to generate
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
@@ -69,22 +71,17 @@ def generate_and_log_molecules(
         if token_id != tokenizer.convert_tokens_to_ids('[UNK]'):
             property_token_ids[token] = token_id
 
-    # Load some ZINC molecules to get realistic property distributions
+    # Sample from eval_smiles_pool for property conditioning
     zinc_properties = []
-    zinc_path = "s3://shvaibackups/unibio_data/zinc22/shuffled/0000.parquet"
+    sampled_smiles = random.sample(eval_smiles_pool, min(100, len(eval_smiles_pool))) if eval_smiles_pool else []
 
-    try:
-        df = pd.read_parquet(zinc_path, columns=['smiles'])
-        zinc_smiles_examples = df['smiles'].sample(n=100).tolist()
-        for smiles in zinc_smiles_examples[:50]:
-            try:
-                props = calculate_properties(smiles)
-                zinc_properties.append(props['quantized_properties'])
-            except:
-                pass
-        print(f"Loaded properties from {len(zinc_properties)} ZINC molecules")
-    except Exception as e:
-        print(f"Error loading ZINC file: {e}")
+    for smiles in sampled_smiles[:50]:
+        try:
+            props = calculate_properties(smiles)
+            zinc_properties.append(props['quantized_properties'])
+        except:
+            pass
+    print(f"Using properties from {len(zinc_properties)} sampled molecules")
 
     # Create initial input: property tokens + BOS for each molecule
     input_ids_list = []
@@ -332,6 +329,214 @@ def generate_and_log_molecules(
     }
 
 
+def mol_conditional_eval(
+    model,
+    tokenizer,
+    reactions,
+    eval_smiles,
+    temperature=1.0,
+    top_p=0.95,
+    max_tokens=200,
+    device='cuda',
+    step=0
+):
+    """
+    Mol-conditional evaluation: given target SMILES, generate [CLS]{smiles}[CLS][BOS]...
+    and measure Tanimoto similarity between generated result and input SMILES.
+
+    Args:
+        model: The EmbeddingConditionalLlamaDecoder model
+        tokenizer: The synthesis tokenizer
+        reactions: Reactions dict from get_reactions()
+        eval_smiles: List of SMILES to condition on
+        temperature: Sampling temperature
+        top_p: Nucleus sampling parameter
+        max_tokens: Maximum tokens to generate
+        device: Device to run generation on
+        step: Current training step (for logging)
+
+    Returns:
+        dict with statistics about mol-conditional generation
+    """
+    import re
+    from tqdm import tqdm
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs, Draw
+    from synthesis.dataloader import property_tokens
+    from synthesis.helpers import execute_path
+
+    model.eval()
+
+    # Get special token IDs
+    bos_token_id = tokenizer.convert_tokens_to_ids('[BOS]')
+    eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
+    cls_token_id = tokenizer.convert_tokens_to_ids('[CLS]')
+
+    # Create input: [CLS]{smiles}[CLS][BOS] for each target molecule
+    input_ids_list = []
+    valid_eval_smiles = []
+
+    for smiles in eval_smiles:
+        # Verify the SMILES is valid
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Skipping invalid eval SMILES: {smiles}")
+            continue
+
+        # Encode [CLS]{smiles}[CLS][BOS]
+        prefix_str = f'[CLS]{smiles}[CLS][BOS]'
+        encoded = tokenizer.encode(prefix_str)
+        token_ids = encoded.ids if hasattr(encoded, 'ids') else encoded
+
+        input_ids_list.append(torch.tensor(token_ids, device=device))
+        valid_eval_smiles.append(smiles)
+
+    if not input_ids_list:
+        print("No valid eval SMILES provided!")
+        return {"avg_tanimoto": 0.0, "validity_rate": 0.0, "num_valid": 0}
+
+    num_molecules = len(input_ids_list)
+    print(f"\nMol-conditional eval: generating {num_molecules} synthesis paths...")
+
+    with torch.no_grad():
+        generated_sequences = model.generate(
+            input_ids_list=input_ids_list,
+            conditioning_embeddings=None,
+            max_generated_tokens=max_tokens,
+            stop_token_id=eos_token_id,
+            temperature=temperature,
+            top_p=top_p,
+        )
+    print(f"Generation complete, got {len(generated_sequences)} sequences")
+
+    # Decode, parse, and execute synthesis paths
+    valid_results = []
+    tanimoto_similarities = []
+    parse_errors = 0
+    execution_errors = 0
+    invalid_count = 0
+
+    print(f"Decoding, parsing, and executing synthesis paths...")
+    for idx, seq in enumerate(tqdm(generated_sequences, desc="Mol-conditional eval", unit="path")):
+        target_smiles = valid_eval_smiles[idx]
+        try:
+            # Decode full sequence
+            seq_list = seq.tolist() if hasattr(seq, 'tolist') else seq
+            decoded_full = tokenizer.decode(seq_list)
+
+            # Remove spaces and special tokens
+            clean_str = decoded_full.replace(' ', '')
+
+            # Remove the [CLS]{smiles}[CLS] prefix using string find (regex fails with brackets in SMILES)
+            first_cls = clean_str.find('[CLS]')
+            if first_cls >= 0:
+                second_cls = clean_str.find('[CLS]', first_cls + 5)
+                if second_cls >= 0:
+                    clean_str = clean_str[:first_cls] + clean_str[second_cls + 5:]
+
+            for tok in ['[BOS]', '[EOS]', '[PAD]'] + property_tokens:
+                clean_str = clean_str.replace(tok, '')
+            clean_str = clean_str.strip()
+
+            # Check if it looks like a valid synthesis path
+            if not clean_str.startswith('<ADD>'):
+                parse_errors += 1
+                invalid_count += 1
+                continue
+
+            # Try to execute the synthesis path
+            result, _ = execute_path(clean_str, reactions)
+
+            if result is None:
+                execution_errors += 1
+                invalid_count += 1
+                continue
+
+            # Validate with RDKit
+            result_mol = Chem.MolFromSmiles(result)
+            if result_mol is None:
+                invalid_count += 1
+                continue
+
+            # Calculate Tanimoto similarity between target and generated
+            target_mol = Chem.MolFromSmiles(target_smiles)
+            fp_target = AllChem.GetMorganFingerprintAsBitVect(target_mol, radius=3, nBits=1024)
+            fp_result = AllChem.GetMorganFingerprintAsBitVect(result_mol, radius=3, nBits=1024)
+            tanimoto = DataStructs.TanimotoSimilarity(fp_target, fp_result)
+
+            tanimoto_similarities.append(tanimoto)
+            valid_results.append({
+                'target': target_smiles,
+                'generated': Chem.MolToSmiles(result_mol, canonical=True),
+                'tanimoto': tanimoto,
+                'path': clean_str,
+            })
+
+        except Exception as e:
+            print(f"Exception in mol-conditional eval: {e}")
+            invalid_count += 1
+            continue
+
+    num_valid = len(valid_results)
+    validity_rate = num_valid / num_molecules if num_molecules > 0 else 0.0
+    avg_tanimoto = np.mean(tanimoto_similarities) if tanimoto_similarities else 0.0
+
+    print(f"\nMol-conditional eval results:")
+    print(f"  Valid: {num_valid}/{num_molecules} ({validity_rate*100:.1f}%)")
+    print(f"  Parse errors: {parse_errors}")
+    print(f"  Execution errors: {execution_errors}")
+    print(f"  Avg Tanimoto similarity: {avg_tanimoto:.4f}")
+
+    # Log some examples
+    for i, res in enumerate(valid_results[:5]):
+        print(f"  Example {i+1}: target={res['target'][:30]}... -> generated={res['generated'][:30]}... (tanimoto={res['tanimoto']:.3f})")
+
+    # Log to wandb
+    if num_valid > 0:
+        log_dict = {
+            "mol_cond/validity_rate": validity_rate,
+            "mol_cond/avg_tanimoto": avg_tanimoto,
+            "mol_cond/num_valid": num_valid,
+            "mol_cond/parse_errors": parse_errors,
+            "mol_cond/execution_errors": execution_errors,
+        }
+
+        # Log histogram of similarities
+        if tanimoto_similarities:
+            log_dict["mol_cond/tanimoto_histogram"] = wandb.Histogram(tanimoto_similarities)
+
+        # Log images of target vs generated for first few valid
+        images = []
+        for res in valid_results[:10]:
+            try:
+                target_mol = Chem.MolFromSmiles(res['target'])
+                gen_mol = Chem.MolFromSmiles(res['generated'])
+                if target_mol and gen_mol:
+                    img = Draw.MolsToGridImage([target_mol, gen_mol], molsPerRow=2,
+                                               subImgSize=(200, 200),
+                                               legends=[f"Target", f"Generated (T={res['tanimoto']:.2f})"])
+                    images.append(wandb.Image(np.array(img), caption=f"Tanimoto: {res['tanimoto']:.3f}"))
+            except Exception as e:
+                print(f"Error creating comparison image: {e}")
+
+        if images:
+            log_dict["mol_cond/comparisons"] = images
+
+        wandb.log(log_dict, step=step)
+
+    model.train()
+
+    return {
+        "avg_tanimoto": avg_tanimoto,
+        "validity_rate": validity_rate,
+        "num_valid": num_valid,
+        "num_molecules": num_molecules,
+        "parse_errors": parse_errors,
+        "execution_errors": execution_errors,
+        "results": valid_results,
+    }
+
+
 def setup_ddp():
     """Initialize distributed training"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -361,10 +566,10 @@ def parse_args():
     ## ARGS GO HERE
     parser = argparse.ArgumentParser(description="Train MolGen2")
 
-    parser.add_argument("--batch_size", type=int, default=220)
+    parser.add_argument("--batch_size", type=int, default=150)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
-    parser.add_argument("--checkpoint", type=str, default='')
+    parser.add_argument("--checkpoint", type=str, default='s3://shvaibackups/robosean/500m_robosean_continue3/30001.pt')
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile")
 
     parser.add_argument("--max_lr", type=float, default=3e-4)
@@ -372,7 +577,7 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=1_000_000)
     parser.add_argument("--max_grad_norm", type=float, default=1.5)
 
-    parser.add_argument("--max_len", type=int, default=150, help="Input len")
+    parser.add_argument("--max_len", type=int, default=200, help="Input len")
 
     parser.add_argument("--save_every_k_steps", type=int, default=15_000)
     parser.add_argument("--generate_every_k_steps", type=int, default=5_000, help="Generate and log molecules every K steps")
@@ -529,6 +734,18 @@ def main():
             config=args,
         )
 
+    # Load eval SMILES once at startup (only on rank 0)
+    eval_smiles_pool = []
+    if rank == 0:
+        import pandas as pd
+        try:
+            zinc_path = "s3://shvaibackups/unibio_data/zinc22/shuffled/0000.parquet"
+            df = pd.read_parquet(zinc_path, columns=['smiles'])
+            eval_smiles_pool = df['smiles'].sample(n=min(1000, len(df))).tolist()
+            print(f"Loaded {len(eval_smiles_pool)} eval SMILES into memory")
+        except Exception as e:
+            print(f"Error loading eval SMILES: {e}")
+
     # Find molecule data files
     #if os.path.exists("/home/ubuntu/shv-storage/unibio_data/zinc22/processed/"):
     #mol_data_path = "/home/ubuntu/zinc22_shuffled/"
@@ -561,6 +778,7 @@ def main():
         tokenizer=tokenizer,
         max_len=args.max_len,
         add_characterization_tokens=True,
+        prefix_mol_probability=0.5,
     )
 
     train_dataloader = DataLoader(
@@ -676,6 +894,7 @@ def main():
                         model=eval_model,
                         tokenizer=tokenizer,
                         reactions=reactions,
+                        eval_smiles_pool=eval_smiles_pool,
                         num_molecules=args.num_generate,
                         temperature=args.generation_temperature,
                         top_p=args.generation_top_p,
@@ -688,6 +907,29 @@ def main():
                     print(f"Validity rate: {generation_stats['validity_rate']*100:.1f}%")
                     if generation_stats['overall_conditioning_total'] > 0:
                         print(f"Overall conditioning accuracy: {generation_stats['overall_conditioning_accuracy']*100:.1f}%")
+
+                    # Mol-conditional eval - sample from the pool
+                    if eval_smiles_pool:
+                        print(f"\n{'='*60}")
+                        print(f"Running mol-conditional evaluation...")
+                        print(f"{'='*60}")
+
+                        # Sample 50 SMILES for mol-conditional eval
+                        mol_cond_smiles = random.sample(eval_smiles_pool, min(50, len(eval_smiles_pool)))
+
+                        mol_cond_stats = mol_conditional_eval(
+                            model=eval_model,
+                            tokenizer=tokenizer,
+                            reactions=reactions,
+                            eval_smiles=mol_cond_smiles,
+                            temperature=args.generation_temperature,
+                            top_p=args.generation_top_p,
+                            max_tokens=args.max_len,
+                            device=device,
+                            step=global_step
+                        )
+                        print(f"Mol-conditional eval: {mol_cond_stats['num_valid']}/{mol_cond_stats['num_molecules']} valid")
+                        print(f"Average Tanimoto similarity: {mol_cond_stats['avg_tanimoto']:.4f}")
 
                     # Clean up eval model
                     del eval_model

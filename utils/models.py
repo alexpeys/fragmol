@@ -968,3 +968,43 @@ class Smile2SmileEncoderWithJEPA(nn.Module):
         }
 
         return out
+
+class PharmocophoreEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([LlamaLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.coordinate_projection = nn.Linear(3, config.hidden_size)
+
+    def forward(self,
+        pharmacophore_coords,
+        pharmacophore_type_ids,
+        attention_mask=None,
+    ):
+        """
+        Args:
+            pharmacophore_coords: [bs, seq_len, 3] - 3D coordinates
+            pharmacophore_type_ids: [bs, seq_len] - type IDs (1-indexed, 0=pad)
+            attention_mask: [bs, seq_len] - 1 for real, 0 for pad
+        Returns:
+            hidden_states: [bs, seq_len, hidden_size]
+        """
+        batch_size, seq_length = pharmacophore_type_ids.size()
+
+        if attention_mask is None:
+            # Create mask from type_ids (0 = pad)
+            attention_mask = (pharmacophore_type_ids != 0).long()
+
+        # Expand for attention: [bs, 1, 1, seq_len]
+        attention_mask = attention_mask.bool().unsqueeze(1).unsqueeze(2)
+
+        hidden_states = self.embed_tokens(pharmacophore_type_ids) + self.coordinate_projection(pharmacophore_coords)
+
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states

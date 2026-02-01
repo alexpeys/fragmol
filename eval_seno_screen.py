@@ -10,22 +10,24 @@ from sklearn.metrics import roc_auc_score
 import xgboost as xgb
 from torch.utils.data import Dataset, DataLoader
 
-from utils.models import Smile2SmileEncoderWithJEPA, LlamaConfig
+from utils.models import Smile2SmileVAE, Smile2SmileEncoderWithJEPA, LlamaConfig
 from tokenizers import Tokenizer
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate on Senolytic Screen")
     parser.add_argument("--model", type=str,
-                        default='s3://shvaibackups/mol_porque/molporque_10layer_jepa0_contrastive1_decode1/40001.pt',
+                        default='s3://shvaibackups/mol_porque/e768_l20_h12_decode1_constrast1/40001.pt',
                         help="Model: 's3://...' or local path, or 'molformer'/'chemberta'/'chemberta-mlm'")
     parser.add_argument("--data_path", type=str, default="seno_data_combined.parquet")
-    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--emb_dim", type=int, default=768)
     parser.add_argument("--intermediate_size_multiplier", type=float, default=4)
-    parser.add_argument("--num_layers", type=int, default=10)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--max_mol_size", type=int, default=200)
+    parser.add_argument("--num_layers", type=int, default=20)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--max_mol_size", type=int, default=120)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--noise_scale", type=float, default=0.0, help="Noise scale for VAE encoding (0 = deterministic)")
+    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument("--seed", type=int, default=42)
     # Fine-tuning args
     parser.add_argument("--full_fine_tune", action="store_true", help="Full fine-tune encoder + linear head")
@@ -33,10 +35,16 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=8, help="Number of fine-tuning epochs")
     parser.add_argument("--ft_batch_size", type=int, default=256, help="Batch size for fine-tuning")
     parser.add_argument("--ft_weight_decay", type=float, default=0, help="Weight decay for fine-tuning")
+    parser.add_argument("--out_file", type=str, default=None, help="Output CSV file for results (optional)")
     return parser.parse_args()
 
 
-def load_encoder(args, tokenizer, device):
+def is_vae_model(model_path):
+    """Check if model path indicates VAE or JEPA model."""
+    return 'mol_vae_v9000' in model_path
+
+
+def load_model(args, tokenizer, device):
     vocab_size = max(tokenizer.get_vocab().values()) + 1
     config_kwargs = dict(
         vocab_size=vocab_size, hidden_size=args.emb_dim,
@@ -49,7 +57,14 @@ def load_encoder(args, tokenizer, device):
     )
     encoder_config = LlamaConfig(**config_kwargs)
     decoder_config = LlamaConfig(**config_kwargs)
-    model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
+
+    use_vae = is_vae_model(args.model)
+    if use_vae:
+        model = Smile2SmileVAE(encoder_config, decoder_config)
+        print("Using VAE model")
+    else:
+        model = Smile2SmileEncoderWithJEPA(encoder_config, decoder_config)
+        print("Using JEPA encoder model")
 
     print(f"Loading checkpoint from: {args.model}")
     if args.model.startswith('s3://'):
@@ -63,7 +78,7 @@ def load_encoder(args, tokenizer, device):
         checkpoint = {k.replace('_orig_mod.', '', 1): v for k, v in checkpoint.items()}
     model.load_state_dict(checkpoint)
     del checkpoint
-    return model.encoder.to(device).eval()
+    return model.to(device).eval(), use_vae
 
 
 class EncoderWithMultiHead(nn.Module):
@@ -77,6 +92,22 @@ class EncoderWithMultiHead(nn.Module):
         output = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         cls_emb = output['hidden_state'][:, 0, :]  # [CLS] token
         # Return logits for all 3 tasks: [batch, 3]
+        return torch.cat([head(cls_emb) for head in self.heads], dim=-1)
+
+
+class HFEncoderWithMultiHead(nn.Module):
+    """HuggingFace model with 3 classification heads for multi-task fine-tuning."""
+    def __init__(self, base_model, emb_dim, num_tasks=3):
+        super().__init__()
+        self.base_model = base_model
+        self.heads = nn.ModuleList([nn.Linear(emb_dim, 1) for _ in range(num_tasks)])
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+            cls_emb = outputs.pooler_output
+        else:
+            cls_emb = outputs.last_hidden_state[:, 0, :]
         return torch.cat([head(cls_emb) for head in self.heads], dim=-1)
 
 
@@ -101,6 +132,28 @@ class SmilesMultiTaskDataset(Dataset):
             'input_ids': torch.tensor(padded_ids, dtype=torch.long),
             'attention_mask': torch.tensor(mask, dtype=torch.bool),
             'labels': torch.tensor(self.labels[idx], dtype=torch.float),  # [3]
+        }
+
+
+class HFSmilesMultiTaskDataset(Dataset):
+    """Dataset for SMILES with multi-task labels using HuggingFace tokenizer."""
+    def __init__(self, smiles_list, labels_dict, tokenizer, max_len=512):
+        self.smiles_list = smiles_list
+        self.labels = np.stack([labels_dict[k] for k in ['kills_young', 'kills_sen', 'senolytic']], axis=1)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.smiles_list)
+
+    def __getitem__(self, idx):
+        smiles = self.smiles_list[idx]
+        encoding = self.tokenizer(smiles, truncation=True, max_length=self.max_len,
+                                  padding='max_length', return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(self.labels[idx], dtype=torch.float),
         }
 
 
@@ -183,7 +236,111 @@ def predict_multitask(model, smiles_list, tokenizer, args, device):
     return np.concatenate(preds, axis=0)  # [N, 3]
 
 
-def get_embeddings(smiles_list, encoder, tokenizer, args, device):
+def load_hf_model_and_tokenizer(model_name, device):
+    """Load HuggingFace model and tokenizer for fine-tuning."""
+    from transformers import AutoModel, AutoTokenizer
+
+    MODEL_CONFIGS = {
+        'molformer': {'model_id': 'ibm/MoLFormer-XL-both-10pct', 'trust_remote_code': True, 'emb_dim': 768},
+        'chemberta': {'model_id': 'DeepChem/ChemBERTa-77M-MTR', 'trust_remote_code': False, 'emb_dim': 384},
+        'chemberta-mlm': {'model_id': 'DeepChem/ChemBERTa-100M-MLM', 'trust_remote_code': False, 'emb_dim': 768},
+    }
+
+    config = MODEL_CONFIGS[model_name]
+    print(f"Loading {model_name} from {config['model_id']}...")
+
+    base_model = AutoModel.from_pretrained(config['model_id'], trust_remote_code=config['trust_remote_code'])
+    tokenizer = AutoTokenizer.from_pretrained(config['model_id'], trust_remote_code=config['trust_remote_code'])
+    base_model = base_model.to(device)
+
+    return base_model, tokenizer, config['emb_dim']
+
+
+def fine_tune_hf_multitask(model_name, train_smiles, train_labels, test_smiles, test_labels, args, device):
+    """Fine-tune HuggingFace model (molformer/chemberta) with multi-task heads."""
+    base_model, tokenizer, emb_dim = load_hf_model_and_tokenizer(model_name, device)
+    model = HFEncoderWithMultiHead(base_model, emb_dim, num_tasks=3).to(device)
+
+    # Verify all parameters are trainable (full fine-tune, not frozen)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params:,}, Trainable: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+
+    train_dataset = HFSmilesMultiTaskDataset(train_smiles, train_labels, tokenizer)
+    test_dataset = HFSmilesMultiTaskDataset(test_smiles, test_labels, tokenizer)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.ft_batch_size, shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=args.ft_batch_size, shuffle=False, num_workers=4)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.ft_weight_decay)
+
+    # Per-task pos_weight for imbalanced data
+    pos_weights = []
+    for key in ['kills_young', 'kills_sen', 'senolytic']:
+        y = train_labels[key]
+        pw = (1 - y.mean()) / max(y.mean(), 1e-6)
+        pos_weights.append(pw)
+    pos_weight_tensor = torch.tensor(pos_weights, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction='mean')
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Test AUC
+        model.eval()
+        test_preds, test_true = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    logits = model(input_ids, attention_mask)
+                test_preds.append(torch.sigmoid(logits).float().cpu().numpy())
+                test_true.append(batch['labels'].numpy())
+
+        test_preds_arr = np.concatenate(test_preds, axis=0)
+        test_true_arr = np.concatenate(test_true, axis=0)
+
+        aucs = [roc_auc_score(test_true_arr[:, i], test_preds_arr[:, i]) for i in range(3)]
+        mean_auc = np.mean(aucs)
+        print(f"  Epoch {epoch+1}: loss={total_loss/len(train_loader):.4f}, "
+              f"test_auc=[{aucs[0]:.3f}, {aucs[1]:.3f}, {aucs[2]:.3f}], mean={mean_auc:.4f}")
+
+    return model, tokenizer
+
+
+def predict_hf_multitask(model, smiles_list, tokenizer, args, device):
+    """Get predictions from fine-tuned HuggingFace multi-task model."""
+    dummy_labels = {k: np.zeros(len(smiles_list)) for k in ['kills_young', 'kills_sen', 'senolytic']}
+    dataset = HFSmilesMultiTaskDataset(smiles_list, dummy_labels, tokenizer)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    model.eval()
+    preds = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Predicting", leave=False):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                logits = model(input_ids, attention_mask)
+            preds.append(torch.sigmoid(logits).float().cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def get_embeddings(smiles_list, model, tokenizer, args, device, use_vae):
     pad_token_id = tokenizer.token_to_id("[PAD]")
     embeddings = []
     for i in tqdm(range(0, len(smiles_list), args.batch_size), desc="Embeddings", leave=False):
@@ -197,8 +354,13 @@ def get_embeddings(smiles_list, encoder, tokenizer, args, device):
         input_ids = torch.tensor(all_ids, dtype=torch.long, device=device)
         attention_mask = torch.tensor(all_masks, dtype=torch.bool, device=device)
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            output = encoder(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
+            if use_vae:
+                encode_out = model.encode(input_ids=input_ids, attention_mask=attention_mask, noise_ratio=args.noise_scale)
+                # latent is [bs, 1, hidden_size], squeeze the middle dim
+                embeddings.append(encode_out['latent'].squeeze(1).float().cpu().numpy())
+            else:
+                output = model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                embeddings.append(output['hidden_state'][:, 0, :].float().cpu().numpy())
     return np.concatenate(embeddings, axis=0)
 
 
@@ -271,7 +433,7 @@ def main():
     args = parse_args()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{args.device}')
     print(f"Using device: {device}")
     print(f"Model: {args.model}")
     print(f"Mode: {'Full Fine-Tune' if args.full_fine_tune else 'Frozen Embeddings'}")
@@ -295,29 +457,30 @@ def main():
         print(f"  {name}: train {y.sum()}/{len(y)} ({100*y.mean():.1f}%), "
               f"test {test_labels[name].sum()}/{len(test_labels[name])} ({100*test_labels[name].mean():.1f}%)")
 
-    # Load encoder/tokenizer
-    encoder, tokenizer = None, None
+    # Load model/tokenizer
+    model, tokenizer, use_vae = None, None, False
     if args.model not in ['molformer', 'chemberta', 'chemberta-mlm']:
         tokenizer = Tokenizer.from_file('tokenizers/smiles_tokenizer_simple/tokenizer.json')
-        encoder = load_encoder(args, tokenizer, device)
-        print("Encoder loaded successfully")
+        model, use_vae = load_model(args, tokenizer, device)
+        print("Model loaded successfully")
 
     if args.full_fine_tune:
-        if args.model in ['molformer', 'chemberta', 'chemberta-mlm']:
-            raise ValueError("Full fine-tuning not supported for baseline models")
-
         train_smiles = train_df['SMILES'].tolist()
         test_smiles = test_df['SMILES'].tolist()
 
         print(f"\n--- Multi-task Fine-tuning (all 3 outcomes simultaneously) ---")
         print(f"Train: {len(train_smiles)}, Test: {len(test_smiles)}")
 
-        # Fine-tune on all 3 tasks
-        model = fine_tune_multitask(encoder, train_smiles, train_labels,
-                                    test_smiles, test_labels, tokenizer, args, device)
-
-        # Final predictions
-        test_preds = predict_multitask(model, test_smiles, tokenizer, args, device)  # [N, 3]
+        if args.model in ['molformer', 'chemberta', 'chemberta-mlm']:
+            # Fine-tune HuggingFace model
+            ft_model, hf_tokenizer = fine_tune_hf_multitask(
+                args.model, train_smiles, train_labels, test_smiles, test_labels, args, device)
+            test_preds = predict_hf_multitask(ft_model, test_smiles, hf_tokenizer, args, device)
+        else:
+            # Fine-tune custom model
+            ft_model = fine_tune_multitask(model.encoder, train_smiles, train_labels,
+                                        test_smiles, test_labels, tokenizer, args, device)
+            test_preds = predict_multitask(ft_model, test_smiles, tokenizer, args, device)
 
         print(f"\n{'='*60}")
         print("FINAL RESULTS (Full Fine-Tune)")
@@ -337,7 +500,7 @@ def main():
         ft_mean = mean_auc_ci(all_ft_stats)
         print(f"{'MEAN (95% CI)':<15} {format_ci(ft_mean, '95'):<35}")
 
-        del model
+        del ft_model
         torch.cuda.empty_cache()
 
     else:
@@ -348,8 +511,8 @@ def main():
             train_emb = get_deepchem_embeddings(train_df['SMILES'].tolist(), args.model, args.batch_size, device)
             test_emb = get_deepchem_embeddings(test_df['SMILES'].tolist(), args.model, args.batch_size, device)
         else:
-            train_emb = get_embeddings(train_df['SMILES'].tolist(), encoder, tokenizer, args, device)
-            test_emb = get_embeddings(test_df['SMILES'].tolist(), encoder, tokenizer, args, device)
+            train_emb = get_embeddings(train_df['SMILES'].tolist(), model, tokenizer, args, device, use_vae)
+            test_emb = get_embeddings(test_df['SMILES'].tolist(), model, tokenizer, args, device, use_vae)
 
         print(f"\n{'='*90}")
         print("SENOLYTIC SCREEN RESULTS (Frozen Embeddings)")
@@ -374,6 +537,35 @@ def main():
         xgb_mean = mean_auc_ci(all_xgb_stats)
         print(f"{'MEAN (95% CI)':<15} {format_ci(lr_mean, '95'):<30} {format_ci(xgb_mean, '95'):<30}")
         print(f"{'MEAN (90% CI)':<15} {format_ci(lr_mean, '90'):<30} {format_ci(xgb_mean, '90'):<30}")
+
+        # Save results to CSV if --out_file is specified
+        if args.out_file is not None:
+            rows = []
+            outcomes = ['kills_young', 'kills_sen', 'senolytic']
+            for outcome, stats in zip(outcomes, all_lr_stats):
+                rows.append({
+                    'dataset': 'seno_screen',
+                    'model': args.model,
+                    'metric_type': f"seno_{outcome}",
+                    'metric_value': stats['mean'],
+                    'metric_90pct_ci': f"[{stats['p05']:.4f}-{stats['p95']:.4f}]",
+                    'metric_95pct_ci': f"[{stats['p025']:.4f}-{stats['p975']:.4f}]",
+                })
+            # Average row
+            rows.append({
+                'dataset': 'seno_screen',
+                'model': args.model,
+                'metric_type': 'seno_avg',
+                'metric_value': lr_mean['mean'],
+                'metric_90pct_ci': f"[{lr_mean['p05']:.4f}-{lr_mean['p95']:.4f}]",
+                'metric_95pct_ci': f"[{lr_mean['p025']:.4f}-{lr_mean['p975']:.4f}]",
+            })
+            out_df = pd.DataFrame(rows)
+            out_dir = os.path.dirname(args.out_file)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            out_df.to_csv(args.out_file, index=False)
+            print(f"\nResults saved to {args.out_file}")
 
 
 if __name__ == "__main__":

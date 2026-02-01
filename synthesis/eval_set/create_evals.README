@@ -1,0 +1,7 @@
+python generate_eval_sets.py
+
+python get_buildingblock_library.py
+
+python get_buildingblock_library.py --input_path zinc22_1000_evals.parquet --output_path zinc22_1000_evals_building_blocks.parquet --min_occurrences 0
+python get_buildingblock_library.py --input_path pubchem_1000_evals.parquet --output_path pubchem_1000_evals_building_blocks.parquet --min_occurrences 0
+python get_buildingblock_library.py --input_path integratedbio_1000_evals.parquet --output_path integratedbio_1000_evals_building_blocks.parquet --min_occurrences 0

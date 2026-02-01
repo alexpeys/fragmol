@@ -6,7 +6,7 @@ import sys
 import time
 from rdkit import Chem
 
-from synthesis.helpers import get_reactions, generate_paths, execute_path
+from helpers import get_reactions, generate_paths, execute_path
 
 
 def parse_annotated_path(annotated):

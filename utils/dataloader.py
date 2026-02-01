@@ -169,7 +169,7 @@ class SmilesVAEDataset(IterableDataset):
 
 
 class SmilesJEPADataset(IterableDataset):
-    def __init__(self, file_list, tokenizer, max_len):
+    def __init__(self, file_list, tokenizer, max_len, pubchem_files=None, use_pubchem=False):
         super().__init__()
 
         self.file_list = file_list
@@ -181,6 +181,9 @@ class SmilesJEPADataset(IterableDataset):
 
         self.tokenizer = tokenizer
         self.max_len = max_len
+
+        self.pubchem_files = pubchem_files
+        self.use_pubchem = use_pubchem
 
     def _pad_and_mask(self, token_ids):
         """Pad token ids to max_len and create attention mask."""
@@ -217,8 +220,17 @@ class SmilesJEPADataset(IterableDataset):
             # Set random seed based on current time
             random.seed(time.time_ns())
             np.random.seed(int(time.time_ns() % 2**32))
+            df = pd.read_parquet(random.sample(self.file_list, 1)[0], columns=['smiles'])
 
-            df = pd.read_parquet(random.sample(self.file_list, 1)[0]).sample(frac=1)
+            if self.use_pubchem:
+                pubchem_to_use = random.sample(self.pubchem_files, 10)
+                pubchem = pd.concat([pd.read_parquet(f, columns=['smiles']) for f in pubchem_to_use])
+                df = pd.concat([df, pubchem]).sample(frac=1)
+
+            # Filter out multi-component SMILES (salts, mixtures, etc.) and long SMILES
+            df = df[~df['smiles'].str.contains('.', regex=False, na=False)]
+            df = df[df['smiles'].str.len() <= self.max_len - 2].sample(frac=1)
+            print(f"Loading a dataframe with: {df.shape} smiles")
 
             for _, row in df.iterrows():
                 smiles = row.smiles
@@ -230,20 +242,21 @@ class SmilesJEPADataset(IterableDataset):
 
                 # Get canonical and random SMILES
                 canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
-                if np.random.rand() < .8:
+                if np.random.rand() < .5:
                     view1_smiles = get_random_smiles(mol)
                 else:
                     view1_smiles = canonical_smiles
 
-                # 50% chance to use fragment instead of full molecule
-                if np.random.rand() >= 0.5:
+                # 10% chance to use fragment instead of full molecule (only for short SMILES)
+                if np.random.rand() >= 0.9 and len(smiles) < 75:
                     try:
                         fragment = get_random_fragment(smiles)
                         if fragment is not None:
                             view2_smiles = fragment
+                        else:
+                            view2_smiles = get_random_smiles(mol)
                     except:
                         view2_smiles = get_random_smiles(mol)
-                        pass  # Keep original smiles on failure
                 else:
                     view2_smiles = get_random_smiles(mol)
 

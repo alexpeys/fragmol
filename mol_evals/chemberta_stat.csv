@@ -1,0 +1,3 @@
+dataset,model,metric_type,metric_value,metric_90pct_ci,metric_95pct_ci
+stat3_screen,chemberta,stat3_is_hit,0.48270708016569586,[0.4265-0.5389],[0.4158-0.5496]
+stat3_screen,chemberta,stat3_avg,0.48270708016569586,[0.4265-0.5389],[0.4158-0.5496]

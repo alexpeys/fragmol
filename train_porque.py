@@ -150,9 +150,9 @@ def cleanup_ddp():
 
 def parse_args():
     ## ARGS GO HERE
-    parser = argparse.ArgumentParser(description="Train VAE")
+    parser = argparse.ArgumentParser(description="Train enc/dec")
 
-    parser.add_argument("--batch_size", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=3, help="Number of dataloader workers")
     parser.add_argument("--checkpoint", type=str, default='')
@@ -160,12 +160,12 @@ def parse_args():
 
     parser.add_argument("--max_lr", type=float, default=5e-4)
     parser.add_argument("--min_lr", type=float, default=5e-4)
-    parser.add_argument("--max_steps", type=int, default=40_100)
+    parser.add_argument("--max_steps", type=int, default=400_100)
     parser.add_argument("--max_grad_norm", type=float, default=1.5)
 
-    parser.add_argument("--max_mol_size", type=int, default=100, help="Maximum molecule size (number of atoms)")
+    parser.add_argument("--max_mol_size", type=int, default=150, help="Maximum molecule size (number of atoms)")
 
-    parser.add_argument("--save_every_k_steps", type=int, default=20_000)
+    parser.add_argument("--save_every_k_steps", type=int, default=40_000)
     parser.add_argument("--generate_every_k_steps", type=int, default=5_000, help="Generate and log molecules every K steps")
     parser.add_argument("--num_generate", type=int, default=100, help="Number of molecules to generate for validation")
     parser.add_argument("--generation_temperature", type=float, default=1.0, help="Temperature for molecule generation")
@@ -175,6 +175,8 @@ def parse_args():
     parser.add_argument("--jepa_loss_scale", type=float, default=0.0, help="JEPA loss scale")
     parser.add_argument("--contrastive_loss_scale", type=float, default=1.0, help="Contrastive loss scale")
     parser.add_argument("--decode_loss_scale", type=float, default=1.0, help="Decode loss scale")
+    #data
+    parser.add_argument("--use_pubchem", action="store_true")
 
     ## 100m model: (emb 512, layers 24, heads 8, intermediate_size_multiplier 4)
     ## 200m model: (emb 768, layers 28, heads 12, intermediate_size_multiplier 3)
@@ -183,10 +185,10 @@ def parse_args():
     ## esmc 600m model: emb 1152, heads 18, layers 36, intermediate_size_multiplier 8/3
     ## 1b model: (emb 1280, layers 40, heads 20, intermediate_size_multiplier 4)
     ## 1.8b model: (emb 1536, layers 48, heads 24, intermediate_size_multiplier 4)
-    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--emb_dim", type=int, default=768)
     parser.add_argument("--intermediate_size_multiplier", type=float, default=4)
-    parser.add_argument("--num_layers", type=int, default=10)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=20)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
 
     parser.add_argument("--local_rank", type=int, default=-1, metavar="N", help="Local process rank.")
 
@@ -353,11 +355,24 @@ def main():
        print(f"Found {len(mol_files)} molecule parquet files.")
 
     mol_files = [m for m in mol_files if m != eval_file]
+
+    pubchem_prefix = 'unibio_data/pubchem/processed/'
+    pubchem_files = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=pubchem_prefix):
+        if 'Contents' in page:
+            for obj in page['Contents']:
+                if obj['Key'].endswith('.parquet'):
+                    pubchem_files.append(f"s3://{bucket_name}/{obj['Key']}")
+    if rank == 0:
+        print(f"Found {len(pubchem_files)} pubchem parquet files.")
+
     # Create dataset and dataloader
     train_dataset = SmilesJEPADataset(
         file_list=mol_files,
         tokenizer=tokenizer,
         max_len=args.max_mol_size,
+        pubchem_files=pubchem_files,
+        use_pubchem=args.use_pubchem,
     )
 
     train_dataloader = DataLoader(

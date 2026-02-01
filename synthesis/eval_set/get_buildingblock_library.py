@@ -8,11 +8,18 @@ from collections import Counter
 from multiprocessing import Pool, cpu_count
 from functools import partial
 
+import numpy as np
 import pandas as pd
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from tqdm import tqdm
 
-from helpers import get_reactions, generate_paths, execute_path
+import sys
+from pathlib import Path
+_repo_root = str(Path(__file__).parent.parent.parent)
+sys.path.insert(0, _repo_root)
+from synthesis.helpers import get_reactions, generate_paths, execute_path
+sys.path.remove(_repo_root)
 
 # Global reactions (loaded once per worker)
 _reactions = None
@@ -71,8 +78,19 @@ def process_molecule(args_tuple):
     return reactants, paths_generated, paths_valid
 
 
+def get_fingerprint(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=1024)
+    return np.array(fp, dtype=np.uint8)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate reactant library from ZINC molecules")
+    parser = argparse.ArgumentParser(description="Generate reactant library from molecules")
+    parser.add_argument("--input_path", type=str, default="s3://shvaibackups/unibio_data/zinc22/shuffled/0000.parquet")
+    parser.add_argument("--output_path", type=str, default="zinc22_0000_blocks.parquet")
+    parser.add_argument("--min_occurrences", type=float, default=25)
     parser.add_argument("--num_mols", type=float, default=1e7,
                         help="Number of molecules to process (default: 1e7)")
     parser.add_argument("--num_paths", type=int, default=5,
@@ -91,8 +109,7 @@ def main():
 
     # Load ZINC data
     print("Loading ZINC data from S3...")
-    zinc_path = "s3://shvaibackups/unibio_data/zinc22/shuffled/0000.parquet"
-    df = pd.read_parquet(zinc_path, columns=['smiles'])
+    df = pd.read_parquet(args.input_path, columns=['smiles'])
     print(f"Loaded {len(df):,} molecules from file")
 
     # Sample if needed
@@ -100,7 +117,7 @@ def main():
         df = df.sample(n=num_mols, random_state=args.seed)
         print(f"Sampled {num_mols:,} molecules")
     else:
-        print(f"Using all {len(df):,} molecules (requested {num_mols:,})")
+        print(f"Using all {len(df):,} molecules")
 
     # Prepare work items with unique seeds
     smiles_list = df['smiles'].tolist()
@@ -143,15 +160,15 @@ def main():
         {'smiles': smi, 'num_occurrences': count}
         for smi, count in reactant_counts.items()
     ])
+    
+    tqdm.pandas(desc="Fingerprints")
+    
     result_df = result_df.sort_values('num_occurrences', ascending=False)
-    result_df.to_parquet(output_path, index=False)
-    print(f"\nSaved {len(result_df):,} reactants to {output_path}")
+    result_df = result_df[result_df['num_occurrences'] >= args.min_occurrences]
+    result_df['fingerprint'] = result_df['smiles'].progress_apply(get_fingerprint)
 
-    # Show top reactants
-    print("\nTop 20 most common reactants:")
-    for smi, count in reactant_counts.most_common(20):
-        print(f"  {count:>8,}  {smi}")
-
+    result_df.to_parquet(args.output_path, index=False)
+    print(f"\nSaved {len(result_df):,} reactants to {args.output_path}")
 
 if __name__ == "__main__":
     main()
